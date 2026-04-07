@@ -31,7 +31,7 @@ func main() {
 	}
 
 	// Scan PDF directory for any un-indexed books on startup
-	added, errs := indexer.ScanDir(cfg.PDFDir, s)
+	added, errs := indexer.ScanDir(cfg.PDFDir, s, func(msg string) { log.Println("startup:", msg) })
 	for _, name := range added {
 		log.Printf("startup: indexed %s", name)
 	}

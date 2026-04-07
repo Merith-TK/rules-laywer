@@ -11,9 +11,14 @@ import (
 	"rules-laywer/store"
 )
 
-// IndexFromURL downloads a PDF from the given URL, indexes it, and returns the book name.
-func IndexFromURL(url, bookName, forceEdition string, s *store.Store) (string, error) {
-	// Download to a temp file
+// IndexFromURL downloads a PDF from the given URL and indexes it.
+// progress may be nil.
+func IndexFromURL(url, bookName, forceEdition string, s *store.Store, progress ProgressFunc) (string, error) {
+	if progress == nil {
+		progress = func(string) {}
+	}
+
+	progress("Downloading PDF...")
 	tmp, err := os.CreateTemp("", "ruleslawyer-*.pdf")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
@@ -36,13 +41,17 @@ func IndexFromURL(url, bookName, forceEdition string, s *store.Store) (string, e
 	}
 	tmp.Close()
 
-	return IndexFromFile(tmp.Name(), bookName, forceEdition, s)
+	return IndexFromFile(tmp.Name(), bookName, forceEdition, s, progress)
 }
 
 // IndexFromFile indexes a PDF from a local file path.
 // bookName defaults to the filename stem if empty.
 // forceEdition overrides auto-detection if non-empty.
-func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string, error) {
+// progress may be nil.
+func IndexFromFile(path, bookName, forceEdition string, s *store.Store, progress ProgressFunc) (string, error) {
+	if progress == nil {
+		progress = func(string) {}
+	}
 	if bookName == "" {
 		bookName = stemName(path)
 	}
@@ -57,7 +66,7 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string,
 	}
 
 	// Extract pages
-	pages, err := ExtractPages(path)
+	pages, err := ExtractPages(path, progress)
 	if err != nil {
 		return "", fmt.Errorf("extract pages: %w", err)
 	}
@@ -68,6 +77,7 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string,
 	// Detect or use forced edition
 	edition := forceEdition
 	if edition == "" {
+		progress("Detecting edition...")
 		edition = DetectEdition(pages)
 	}
 
@@ -78,6 +88,7 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string,
 	}
 
 	// Chunk and store
+	progress(fmt.Sprintf("Storing %d pages into index...", len(pages)))
 	rawChunks := ChunkPages(pages, 400)
 	storeChunks := make([]store.Chunk, len(rawChunks))
 	for i, c := range rawChunks {
@@ -90,7 +101,6 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string,
 	}
 
 	if err := s.AddChunks(bookID, bookName, edition, storeChunks); err != nil {
-		// Roll back book registration on chunk failure
 		s.RemoveBook(bookName) //nolint:errcheck
 		return "", fmt.Errorf("add chunks: %w", err)
 	}
@@ -99,8 +109,12 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store) (string,
 }
 
 // ScanDir indexes all PDFs in dir that are not already in the store.
-// Returns a summary of what was indexed and any errors encountered.
-func ScanDir(dir string, s *store.Store) (added []string, errs []error) {
+// progress receives per-book status updates. progress may be nil.
+func ScanDir(dir string, s *store.Store, progress ProgressFunc) (added []string, errs []error) {
+	if progress == nil {
+		progress = func(string) {}
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -109,15 +123,15 @@ func ScanDir(dir string, s *store.Store) (added []string, errs []error) {
 		return nil, []error{fmt.Errorf("read dir %s: %w", dir, err)}
 	}
 
+	// Count PDFs to index for progress display
+	var pdfs []os.DirEntry
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".pdf") {
+			pdfs = append(pdfs, e)
 		}
-		if !strings.EqualFold(filepath.Ext(e.Name()), ".pdf") {
-			continue
-		}
+	}
 
-		path := filepath.Join(dir, e.Name())
+	for n, e := range pdfs {
 		bookName := stemName(e.Name())
 
 		exists, err := s.BookExists(bookName)
@@ -129,7 +143,9 @@ func ScanDir(dir string, s *store.Store) (added []string, errs []error) {
 			continue
 		}
 
-		edition, err := IndexFromFile(path, bookName, "", s)
+		progress(fmt.Sprintf("[%d/%d] Indexing: %s", n+1, len(pdfs), bookName))
+		path := filepath.Join(dir, e.Name())
+		edition, err := IndexFromFile(path, bookName, "", s, progress)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", e.Name(), err))
 			continue

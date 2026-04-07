@@ -53,16 +53,17 @@ func (b *Bot) cmdBooks() string {
 
 // cmdUpload handles the /upload command and !upload prefix.
 // pdfURL and pdfPath are mutually exclusive sources.
-func (b *Bot) cmdUpload(pdfURL, pdfPath, bookName, forceEdition string) string {
+// progress is called with status updates during indexing.
+func (b *Bot) cmdUpload(pdfURL, pdfPath, bookName, forceEdition string, progress indexer.ProgressFunc) string {
 	var (
 		edition string
 		err     error
 	)
 
 	if pdfURL != "" {
-		edition, err = indexer.IndexFromURL(pdfURL, bookName, forceEdition, b.store)
+		edition, err = indexer.IndexFromURL(pdfURL, bookName, forceEdition, b.store, progress)
 	} else if pdfPath != "" {
-		edition, err = indexer.IndexFromFile(pdfPath, bookName, forceEdition, b.store)
+		edition, err = indexer.IndexFromFile(pdfPath, bookName, forceEdition, b.store, progress)
 	} else {
 		return "Please attach a PDF or provide a URL."
 	}
@@ -79,8 +80,9 @@ func (b *Bot) cmdUpload(pdfURL, pdfPath, bookName, forceEdition string) string {
 }
 
 // cmdScan handles the /scan command and !scan prefix.
-func (b *Bot) cmdScan() string {
-	added, errs := indexer.ScanDir(b.pdfDir, b.store)
+// progress is called with status updates during indexing.
+func (b *Bot) cmdScan(progress indexer.ProgressFunc) string {
+	added, errs := indexer.ScanDir(b.pdfDir, b.store, progress)
 
 	var sb strings.Builder
 	if len(added) > 0 {

@@ -8,8 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"rules-laywer/indexer"
 )
 
 const prefix = "!"
@@ -47,18 +51,18 @@ func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 			response = "You don't have permission to upload books. See `config.yaml` to configure admin access."
 			break
 		}
-		edition := optString(data.Options, "edition")
+		editionFlag := optString(data.Options, "edition")
 		url := optString(data.Options, "url")
 		name := optString(data.Options, "name")
 
-		// Check for attachment in the originating message
 		pdfPath := ""
 		if i.Message != nil && len(i.Message.Attachments) > 0 {
 			att := i.Message.Attachments[0]
 			if strings.EqualFold(filepath.Ext(att.Filename), ".pdf") {
-				pdfPath, err = downloadAttachment(att.URL, att.Filename)
-				if err != nil {
-					response = fmt.Sprintf("Failed to download attachment: %v", err)
+				var dlErr error
+				pdfPath, dlErr = downloadAttachment(att.URL, att.Filename)
+				if dlErr != nil {
+					response = fmt.Sprintf("Failed to download attachment: %v", dlErr)
 					break
 				}
 				defer os.Remove(pdfPath)
@@ -67,14 +71,19 @@ func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 				}
 			}
 		}
-		response = b.cmdUpload(url, pdfPath, name, edition)
+
+		response = b.runWithLiveProgress(s, i, func(progress indexer.ProgressFunc) string {
+			return b.cmdUpload(url, pdfPath, name, editionFlag, progress)
+		})
 
 	case "scan":
 		if !b.isAdmin(s, i.GuildID, i.Member) {
 			response = "You don't have permission to scan for books. See `config.yaml` to configure admin access."
 			break
 		}
-		response = b.cmdScan()
+		response = b.runWithLiveProgress(s, i, func(progress indexer.ProgressFunc) string {
+			return b.cmdScan(progress)
+		})
 
 	case "remove":
 		if !b.isAdmin(s, i.GuildID, i.Member) {
@@ -90,18 +99,7 @@ func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 	if response == "" {
 		response = "(no response)"
 	}
-
-	// Discord messages have a 2000 char limit; truncate if needed
-	if len(response) > 1990 {
-		response = response[:1987] + "..."
-	}
-
-	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content: &response,
-	})
-	if err != nil {
-		log.Printf("error: edit interaction response: %v", err)
-	}
+	editInteraction(s, i, response)
 }
 
 // onMessage handles prefix-based commands (e.g. !ask, !books).
@@ -128,7 +126,6 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	switch cmd {
 	case "ask":
-		// Support optional edition: prefix  e.g. !ask edition:5e2024 what is grappling?
 		question, edition := parseEditionPrefix(args)
 		response = b.cmdAsk(question, edition)
 
@@ -140,16 +137,15 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 			response = "You don't have permission to upload books. See `config.yaml` to configure admin access."
 			break
 		}
-		// Parse args: [edition:<tag>] [name:<name>] [url:<url>] or attachment
-		edition, name, url := parseUploadArgs(args)
+		editionFlag, name, url := parseUploadArgs(args)
 		pdfPath := ""
 		if len(m.Attachments) > 0 {
 			att := m.Attachments[0]
 			if strings.EqualFold(filepath.Ext(att.Filename), ".pdf") {
-				var err error
-				pdfPath, err = downloadAttachment(att.URL, att.Filename)
-				if err != nil {
-					response = fmt.Sprintf("Failed to download attachment: %v", err)
+				var dlErr error
+				pdfPath, dlErr = downloadAttachment(att.URL, att.Filename)
+				if dlErr != nil {
+					response = fmt.Sprintf("Failed to download attachment: %v", dlErr)
 					break
 				}
 				defer os.Remove(pdfPath)
@@ -158,14 +154,41 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 				}
 			}
 		}
-		response = b.cmdUpload(url, pdfPath, name, edition)
+		// Send a placeholder then update it when done
+		sent, sendErr := s.ChannelMessageSend(m.ChannelID, "Indexing...")
+		if sendErr != nil {
+			log.Printf("error sending progress message: %v", sendErr)
+		}
+		response = b.cmdUpload(url, pdfPath, name, editionFlag, func(msg string) {
+			if sent != nil {
+				content := "Indexing... " + msg
+				s.ChannelMessageEdit(m.ChannelID, sent.ID, content) //nolint:errcheck
+			}
+		})
+		if sent != nil {
+			s.ChannelMessageEdit(m.ChannelID, sent.ID, response) //nolint:errcheck
+			return
+		}
 
 	case "scan":
 		if !b.isAdminByMessage(s, m) {
 			response = "You don't have permission to scan for books. See `config.yaml` to configure admin access."
 			break
 		}
-		response = b.cmdScan()
+		sent, sendErr := s.ChannelMessageSend(m.ChannelID, "Scanning...")
+		if sendErr != nil {
+			log.Printf("error sending progress message: %v", sendErr)
+		}
+		response = b.cmdScan(func(msg string) {
+			if sent != nil {
+				content := "Scanning... " + msg
+				s.ChannelMessageEdit(m.ChannelID, sent.ID, content) //nolint:errcheck
+			}
+		})
+		if sent != nil {
+			s.ChannelMessageEdit(m.ChannelID, sent.ID, response) //nolint:errcheck
+			return
+		}
 
 	case "remove":
 		if !b.isAdminByMessage(s, m) {
@@ -175,18 +198,68 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 		response = b.cmdRemove(args)
 
 	default:
-		return // ignore unknown prefix commands
+		return
 	}
 
 	if response == "" {
 		return
 	}
-	if len(response) > 1990 {
-		response = response[:1987] + "..."
-	}
-	if _, err := s.ChannelMessageSend(m.ChannelID, response); err != nil {
+	if _, err := s.ChannelMessageSend(m.ChannelID, truncate(response)); err != nil {
 		log.Printf("error: send message: %v", err)
 	}
+}
+
+// runWithLiveProgress runs fn in a goroutine, updating the Discord deferred
+// interaction response every 2 seconds until fn completes.
+func (b *Bot) runWithLiveProgress(s *discordgo.Session, i *discordgo.InteractionCreate, fn func(indexer.ProgressFunc) string) string {
+	var (
+		mu      sync.Mutex
+		current = "Starting..."
+	)
+
+	progress := func(msg string) {
+		mu.Lock()
+		current = msg
+		mu.Unlock()
+	}
+
+	resultCh := make(chan string, 1)
+	go func() {
+		resultCh <- fn(progress)
+	}()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			mu.Lock()
+			msg := truncate("⏳ " + current)
+			mu.Unlock()
+			editInteraction(s, i, msg)
+		case result := <-resultCh:
+			return result
+		}
+	}
+}
+
+// editInteraction edits a deferred slash command response.
+func editInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	content = truncate(content)
+	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &content,
+	}); err != nil {
+		log.Printf("error: edit interaction response: %v", err)
+	}
+}
+
+// truncate caps a string at Discord's 2000-character message limit.
+func truncate(s string) string {
+	if len(s) > 1990 {
+		return s[:1987] + "..."
+	}
+	return s
 }
 
 // isAdmin checks if the member has admin access via user ID, role ID, or role name.
@@ -195,14 +268,12 @@ func (b *Bot) isAdmin(s *discordgo.Session, guildID string, member *discordgo.Me
 		return false
 	}
 
-	// Check explicit user IDs first
 	for _, uid := range b.admin.UserIDs {
 		if uid == member.User.ID {
 			return true
 		}
 	}
 
-	// Check member's roles against configured role IDs and role names
 	for _, roleID := range member.Roles {
 		for _, adminRoleID := range b.admin.RoleIDs {
 			if roleID == adminRoleID {

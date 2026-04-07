@@ -1,11 +1,11 @@
 package indexer
 
 import (
-	"bytes"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
-
-	"github.com/ledongthuc/pdf"
 )
 
 // PageText holds extracted text for a single page.
@@ -14,50 +14,132 @@ type PageText struct {
 	Content string
 }
 
-// ExtractPages extracts text from each page of a PDF file.
-func ExtractPages(path string) ([]PageText, error) {
-	f, r, err := pdf.Open(path)
+// ProgressFunc is called during extraction to report status.
+// msg is a human-readable status string suitable for display in Discord.
+type ProgressFunc func(msg string)
+
+// ExtractPages extracts text from a PDF, with two strategies in order:
+//  1. pdftotext (poppler) — handles most PDFs with embedded text
+//  2. OCR via pdftoppm + tesseract — for scanned image PDFs
+//
+// progress may be nil. Returns an error only if all strategies fail.
+func ExtractPages(path string, progress ProgressFunc) ([]PageText, error) {
+	if progress == nil {
+		progress = func(string) {}
+	}
+
+	// Strategy 1: pdftotext
+	progress("Extracting text...")
+	pages, err := extractWithPDFToText(path)
+	if err == nil && hasText(pages) {
+		return pages, nil
+	}
+
+	// Strategy 2: OCR
+	progress("No embedded text found — starting OCR (this may take several minutes)...")
+	pages, err = extractWithOCR(path, progress)
 	if err != nil {
-		return nil, fmt.Errorf("open pdf: %w", err)
+		return nil, fmt.Errorf("all extraction methods failed (install poppler and tesseract); last error: %w", err)
 	}
-	defer f.Close()
-
-	totalPages := r.NumPage()
-	pages := make([]PageText, 0, totalPages)
-
-	for i := 1; i <= totalPages; i++ {
-		p := r.Page(i)
-		if p.V.IsNull() {
-			continue
-		}
-		text, err := extractPageText(p)
-		if err != nil {
-			// Skip pages that fail; don't abort the whole PDF
-			continue
-		}
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		pages = append(pages, PageText{Page: i, Content: text})
+	if !hasText(pages) {
+		return nil, fmt.Errorf("no text found after OCR — PDF may be corrupt or an unsupported format")
 	}
-
 	return pages, nil
 }
 
-func extractPageText(p pdf.Page) (string, error) {
-	var buf bytes.Buffer
-	content := p.Content()
-	for _, text := range content.Text {
-		buf.WriteString(text.S)
-		buf.WriteByte(' ')
+// extractWithPDFToText uses pdftotext (poppler) to extract text.
+// Pages are separated by form-feed characters (\f) in the output.
+func extractWithPDFToText(path string) ([]PageText, error) {
+	out, err := exec.Command("pdftotext", path, "-").Output()
+	if err != nil {
+		return nil, fmt.Errorf("pdftotext: %w", err)
 	}
-	return buf.String(), nil
+
+	// pdftotext separates pages with \f
+	rawPages := strings.Split(string(out), "\f")
+	var pages []PageText
+	for i, text := range rawPages {
+		text = strings.TrimSpace(text)
+		if text != "" {
+			pages = append(pages, PageText{Page: i + 1, Content: text})
+		}
+	}
+	return pages, nil
+}
+
+// extractWithOCR renders each PDF page to an image with pdftoppm then
+// runs tesseract on each image to produce text.
+func extractWithOCR(path string, progress ProgressFunc) ([]PageText, error) {
+	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		return nil, fmt.Errorf("pdftoppm not found (install poppler)")
+	}
+	if _, err := exec.LookPath("tesseract"); err != nil {
+		return nil, fmt.Errorf("tesseract not found (install tesseract)")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "ruleslawyer-ocr-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Render all pages as PNG images at 200 DPI
+	prefix := filepath.Join(tmpDir, "page")
+	if err := exec.Command("pdftoppm", "-r", "200", "-png", path, prefix).Run(); err != nil {
+		return nil, fmt.Errorf("pdftoppm: %w", err)
+	}
+
+	// Collect rendered page images in order
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return nil, fmt.Errorf("read temp dir: %w", err)
+	}
+
+	// Count total pages for progress reporting
+	total := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".png") {
+			total++
+		}
+	}
+
+	var pages []PageText
+	pageNum := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".png") {
+			continue
+		}
+		pageNum++
+		progress(fmt.Sprintf("OCR: page %d/%d", pageNum, total))
+		imgPath := filepath.Join(tmpDir, e.Name())
+
+		// tesseract <image> stdout — writes text to stdout
+		out, err := exec.Command("tesseract", imgPath, "stdout", "-l", "eng", "--psm", "1").Output()
+		if err != nil {
+			// Skip pages that fail OCR rather than aborting
+			continue
+		}
+		text := strings.TrimSpace(string(out))
+		if text != "" {
+			pages = append(pages, PageText{Page: pageNum, Content: text})
+		}
+	}
+	return pages, nil
+}
+
+// hasText returns true if at least one page has non-trivial content.
+func hasText(pages []PageText) bool {
+	for _, p := range pages {
+		if len(strings.Fields(p.Content)) > 5 {
+			return true
+		}
+	}
+	return false
 }
 
 // DetectEdition scans the first few pages of text for edition markers.
 // Returns a normalized edition tag or "unknown".
 func DetectEdition(pages []PageText) string {
-	// Combine first 3 pages for heuristic scanning
 	sample := ""
 	for i, p := range pages {
 		if i >= 3 {
@@ -82,7 +164,6 @@ func DetectEdition(pages []PageText) string {
 	case contains(sample, "3.5") || contains(sample, "v.3.5"):
 		return "dnd3.5e"
 	case contains(sample, "dungeons & dragons") || contains(sample, "d&d"):
-		// Generic D&D — default to 5e2014 as most common
 		return "5e2014"
 	default:
 		return "unknown"
@@ -101,8 +182,7 @@ func ChunkPages(pages []PageText, wordsPerChunk int) []chunkWithPage {
 
 	var chunks []chunkWithPage
 	for _, p := range pages {
-		pageChunks := chunkText(p.Content, wordsPerChunk)
-		for _, c := range pageChunks {
+		for _, c := range chunkText(p.Content, wordsPerChunk) {
 			chunks = append(chunks, chunkWithPage{Page: p.Page, Content: c})
 		}
 	}
@@ -129,7 +209,6 @@ func chunkText(text string, maxWords int) []string {
 		if end > len(words) {
 			end = len(words)
 		}
-		// Try to break at a sentence end (period, ?, !)
 		if end < len(words) {
 			for i := end; i > start+maxWords/2; i-- {
 				w := words[i-1]

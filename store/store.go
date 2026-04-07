@@ -112,13 +112,28 @@ func (s *Store) AddChunks(bookID int64, bookName, edition string, chunks []Chunk
 
 // SearchChunks performs an FTS5 search and returns the top results.
 // If edition is non-empty, results are filtered to that edition.
+// Strategy: try AND (all words must match), fall back to OR (any word matches)
+// so that conversational questions like "what is a saving throw?" still find results.
 func (s *Store) SearchChunks(query, edition string, limit int) ([]Chunk, error) {
+	andQuery := sanitizeFTS(query, "AND")
+	orQuery := sanitizeFTS(query, "OR")
+
+	results, err := s.runSearch(andQuery, edition, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) > 0 {
+		return results, nil
+	}
+	// AND matched nothing — widen to OR
+	return s.runSearch(orQuery, edition, limit)
+}
+
+func (s *Store) runSearch(ftsQuery, edition string, limit int) ([]Chunk, error) {
 	var (
 		rows *sql.Rows
 		err  error
 	)
-
-	ftsQuery := sanitizeFTS(query)
 
 	if edition != "" {
 		rows, err = s.db.Query(`
@@ -138,6 +153,7 @@ func (s *Store) SearchChunks(query, edition string, limit int) ([]Chunk, error) 
 		`, ftsQuery, limit)
 	}
 	if err != nil {
+		// FTS5 syntax errors should not propagate as hard errors
 		return nil, fmt.Errorf("fts search: %w", err)
 	}
 	defer rows.Close()
@@ -200,18 +216,22 @@ func (s *Store) RemoveBook(name string) (bool, error) {
 	return true, tx.Commit()
 }
 
-// sanitizeFTS builds an FTS5 query that AND-matches all words in the input.
-// Special FTS5 syntax characters are stripped to prevent parse errors.
-func sanitizeFTS(q string) string {
+// sanitizeFTS builds an FTS5 query joining all words with the given operator ("AND" or "OR").
+// All non-alphanumeric characters are replaced with spaces to prevent FTS5 syntax errors.
+func sanitizeFTS(q, op string) string {
 	q = strings.TrimSpace(q)
-	// Strip FTS5 special characters
-	for _, ch := range []string{`"`, `*`, `(`, `)`, `^`, `-`} {
-		q = strings.ReplaceAll(q, ch, " ")
+	// Replace anything that isn't a letter, digit, or space with a space
+	var sb strings.Builder
+	for _, r := range q {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte(' ')
+		}
 	}
-	words := strings.Fields(q)
+	words := strings.Fields(sb.String())
 	if len(words) == 0 {
 		return `""`
 	}
-	// Join words with AND for multi-word matching
-	return strings.Join(words, " AND ")
+	return strings.Join(words, " "+op+" ")
 }
