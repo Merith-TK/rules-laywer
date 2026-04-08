@@ -18,8 +18,18 @@ type AdminConfig struct {
 	UserIDs   []string `yaml:"user_ids"`   // specific Discord user snowflake IDs
 }
 
+// TokensConfig holds API tokens that may be set in config.yaml instead of
+// (or in addition to) environment variables. Environment variables always
+// take precedence over values defined here.
+type TokensConfig struct {
+	DiscordToken   string `yaml:"discord_token"`
+	DiscordGuildID string `yaml:"discord_guild_id"`
+	AnthropicKey   string `yaml:"anthropic_api_key"`
+}
+
 type yamlConfig struct {
-	Admin AdminConfig `yaml:"admin"`
+	Tokens TokensConfig `yaml:"tokens"`
+	Admin  AdminConfig  `yaml:"admin"`
 }
 
 type Config struct {
@@ -32,8 +42,12 @@ type Config struct {
 }
 
 // LoadConfig loads configuration from the data directory.
-//   - Secrets  → <dataDir>/.env
-//   - Settings → <dataDir>/config.yaml
+//   - Secrets  → <dataDir>/.env  (loaded into environment before reading)
+//   - Settings → <dataDir>/config.yaml  (tokens + admin)
+//
+// Resolution order for tokens (highest priority first):
+//  1. Environment variable (e.g. DISCORD_TOKEN)
+//  2. config.yaml `tokens` section
 //
 // DB and PDF paths default to subdirectories of dataDir.
 func LoadConfig(dataDir string) Config {
@@ -45,22 +59,23 @@ func LoadConfig(dataDir string) Config {
 	_ = godotenv.Load(filepath.Join(dataDir, ".env"))
 
 	// Load settings from config.yaml
-	adminCfg := loadYAMLConfig(filepath.Join(dataDir, "config.yaml"))
+	yamlCfg := loadYAMLConfig(filepath.Join(dataDir, "config.yaml"))
 
+	// Resolve each token: env var wins, yaml value is the fallback.
 	cfg := Config{
-		DiscordToken:   os.Getenv("DISCORD_TOKEN"),
-		DiscordGuildID: os.Getenv("DISCORD_GUILD_ID"),
-		AnthropicKey:   os.Getenv("ANTHROPIC_API_KEY"),
-		Admin:          adminCfg,
+		DiscordToken:   firstNonEmpty(os.Getenv("DISCORD_TOKEN"), yamlCfg.Tokens.DiscordToken),
+		DiscordGuildID: firstNonEmpty(os.Getenv("DISCORD_GUILD_ID"), yamlCfg.Tokens.DiscordGuildID),
+		AnthropicKey:   firstNonEmpty(os.Getenv("ANTHROPIC_API_KEY"), yamlCfg.Tokens.AnthropicKey),
+		Admin:          yamlCfg.Admin,
 		DBPath:         getEnvDefault("DB_PATH", filepath.Join(dataDir, "rules.db")),
 		PDFDir:         getEnvDefault("PDF_DIR", filepath.Join(dataDir, "pdfs")),
 	}
 
 	if cfg.DiscordToken == "" {
-		log.Fatal("DISCORD_TOKEN is required (set in <data-dir>/.env)")
+		log.Fatal("DISCORD_TOKEN is required (set DISCORD_TOKEN env var, <data-dir>/.env, or tokens.discord_token in config.yaml)")
 	}
 	if cfg.AnthropicKey == "" {
-		log.Fatal("ANTHROPIC_API_KEY is required (set in <data-dir>/.env)")
+		log.Fatal("ANTHROPIC_API_KEY is required (set ANTHROPIC_API_KEY env var, <data-dir>/.env, or tokens.anthropic_api_key in config.yaml)")
 	}
 
 	return cfg
@@ -68,11 +83,11 @@ func LoadConfig(dataDir string) Config {
 
 // loadYAMLConfig reads config.yaml. If the file doesn't exist it writes a
 // default one and returns the default config so the bot still starts.
-func loadYAMLConfig(path string) AdminConfig {
+func loadYAMLConfig(path string) yamlConfig {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		writeDefaultYAML(path)
-		return defaultAdminConfig()
+		return yamlConfig{Admin: defaultAdminConfig()}
 	}
 	if err != nil {
 		log.Fatalf("read %s: %v", path, err)
@@ -85,9 +100,9 @@ func loadYAMLConfig(path string) AdminConfig {
 
 	// If the file exists but admin section is empty, use defaults
 	if len(yc.Admin.RoleNames) == 0 && len(yc.Admin.RoleIDs) == 0 && len(yc.Admin.UserIDs) == 0 {
-		return defaultAdminConfig()
+		yc.Admin = defaultAdminConfig()
 	}
-	return yc.Admin
+	return yc
 }
 
 func defaultAdminConfig() AdminConfig {
@@ -98,8 +113,16 @@ func defaultAdminConfig() AdminConfig {
 
 func writeDefaultYAML(path string) {
 	const defaultContent = `# Rules Lawyer — bot configuration
-# Edit this file to control who can manage rulebooks.
 
+# API tokens can optionally be set here instead of (or in addition to) environment
+# variables. Environment variables always take priority over values defined below.
+#
+# tokens:
+#   discord_token: your_discord_bot_token_here
+#   discord_guild_id: ""          # optional: guild ID for instant command registration
+#   anthropic_api_key: your_anthropic_api_key_here
+
+# Controls who can manage books (upload/remove/scan).
 admin:
   # Role names (case-insensitive). Users with any of these roles can
   # upload, remove, and scan books.
@@ -126,4 +149,14 @@ func getEnvDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// firstNonEmpty returns the first non-empty string from the provided values.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

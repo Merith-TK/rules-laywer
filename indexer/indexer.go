@@ -1,3 +1,39 @@
+// Package indexer handles the full pipeline for turning a PDF rulebook into
+// searchable chunks stored in the database.
+//
+// # Indexing pipeline
+//
+// Given a PDF file (local path or remote URL), the pipeline runs as follows:
+//
+//  1. Text extraction (pdf.go — ExtractPages):
+//     a. pdftotext (poppler) is tried first. It splits the output on form-feed
+//     characters (\f) to produce one PageText per PDF page.
+//     b. If pdftotext produces no meaningful text (scanned/image PDF), OCR is
+//     attempted: pdftoppm renders each page to a PNG at 200 DPI, then
+//     tesseract converts each PNG to text.
+//
+//  2. Edition detection (pdf.go — DetectEdition):
+//     The first three pages of extracted text are concatenated and searched for
+//     well-known edition markers (e.g. "pathfinder second edition", "2024",
+//     "3.5"). Returns a normalised tag such as "5e2014" or "pathfinder2e", or
+//     "unknown" when no marker is found. Can be overridden by the caller.
+//
+//  3. Chunking (pdf.go — ChunkPages):
+//     Each page's text is split into ~400-word chunks. Chunk boundaries are
+//     moved backwards to the nearest sentence-ending punctuation (. ! ?) so
+//     that chunks do not cut mid-sentence. Each chunk retains its source page
+//     number for citation.
+//
+//  4. Storage (store package — AddBook / AddChunks):
+//     The book record is inserted first, then all chunks are bulk-inserted into
+//     an SQLite FTS5 table in a single transaction. If chunk insertion fails the
+//     book record is rolled back.
+//
+// # Entry points
+//
+//   - IndexFromFile — index a local PDF file.
+//   - IndexFromURL  — download a PDF from a URL then index it.
+//   - ScanDir       — index every unindexed PDF in a directory (used on startup).
 package indexer
 
 import (
@@ -11,7 +47,9 @@ import (
 	"rules-laywer/store"
 )
 
-// IndexFromURL downloads a PDF from the given URL and indexes it.
+// IndexFromURL downloads a PDF from the given URL to a temporary file and
+// then calls IndexFromFile. The temporary file is removed when indexing
+// completes (success or failure).
 // progress may be nil.
 func IndexFromURL(url, bookName, forceEdition string, s *store.Store, progress ProgressFunc) (string, error) {
 	if progress == nil {
@@ -45,6 +83,14 @@ func IndexFromURL(url, bookName, forceEdition string, s *store.Store, progress P
 }
 
 // IndexFromFile indexes a PDF from a local file path.
+//
+// Steps performed (see package doc for full details):
+//  1. Duplicate check — returns an error if bookName is already in the store.
+//  2. Text extraction via ExtractPages (pdftotext → OCR fallback).
+//  3. Edition detection via DetectEdition (or forceEdition if provided).
+//  4. Book record insertion.
+//  5. Chunk creation and bulk insertion inside a transaction.
+//
 // bookName defaults to the filename stem if empty.
 // forceEdition overrides auto-detection if non-empty.
 // progress may be nil.
@@ -109,6 +155,16 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store, progress
 }
 
 // ScanDir indexes all PDFs in dir that are not already in the store.
+// It is called automatically on startup and via the /scan command.
+//
+// For each .pdf file found:
+//  1. The book name is derived from the filename stem (no extension).
+//  2. The store is checked for an existing book with that name; already-indexed
+//     books are silently skipped.
+//  3. IndexFromFile is called for new books with empty forceEdition (auto-detect).
+//
+// added returns the names of newly indexed books (with detected edition).
+// errs collects per-book errors; other books continue processing on error.
 // progress receives per-book status updates. progress may be nil.
 func ScanDir(dir string, s *store.Store, progress ProgressFunc) (added []string, errs []error) {
 	if progress == nil {

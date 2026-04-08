@@ -29,7 +29,9 @@ mkdir -p rules-laywer-data
 cp .env.example rules-laywer-data/.env
 ```
 
-Edit `rules-laywer-data/.env` (secrets only):
+**Option A — secrets in `.env`** (recommended for local use)
+
+Edit `rules-laywer-data/.env`:
 
 ```env
 DISCORD_TOKEN=your_discord_bot_token
@@ -37,7 +39,18 @@ DISCORD_GUILD_ID=your_server_id    # optional but recommended for dev
 ANTHROPIC_API_KEY=your_anthropic_key
 ```
 
-Admin configuration lives in `rules-laywer-data/config.yaml` (auto-created on first run):
+**Option B — tokens in `config.yaml`** (useful for container/managed deployments)
+
+You can also set tokens directly in `config.yaml`. Environment variables and `.env` values always take priority over values defined here.
+
+```yaml
+tokens:
+  discord_token: your_discord_bot_token
+  discord_guild_id: ""          # optional
+  anthropic_api_key: your_anthropic_api_key
+```
+
+**Admin configuration** lives in `rules-laywer-data/config.yaml` (auto-created on first run):
 
 ```yaml
 admin:
@@ -71,7 +84,47 @@ Required permissions: `Send Messages`, `Read Message History`.
 
 ---
 
-## Adding rulebooks
+## How indexing works
+
+When you add a PDF (via `/upload`, `/scan`, or the startup scan), the following pipeline runs:
+
+### Step 1 — Text extraction
+
+The indexer first tries **pdftotext** (part of the [poppler](https://poppler.freedesktop.org/) suite). It outputs all page text separated by form-feed characters (`\f`), which are split into per-page records.
+
+If pdftotext produces fewer than 5 words per page — indicating a scanned/image-only PDF — the indexer falls back to **OCR**:
+1. `pdftoppm` renders each page to a PNG image at 200 DPI.
+2. `tesseract` runs on each image with English language data and auto page-segmentation (`--psm 1`).
+
+> **Note:** Both `pdftotext` and `pdftoppm`/`tesseract` must be installed on the host system. OCR can take several minutes for large books.
+
+### Step 2 — Edition detection
+
+The first **three pages** of extracted text are concatenated and searched for well-known markers (checked in priority order):
+
+| Marker pattern | Detected edition |
+|---|---|
+| "pathfinder second edition" or "pathfinder 2e" | `pathfinder2e` |
+| "pathfinder roleplaying game" (without "second edition") | `pathfinder1e` |
+| "revised" + ("2024" or "one d&d") | `5e2024` |
+| "dungeons & dragons" + "2024" (without "revised") | `5e2024` |
+| ("5th edition" or "dungeons & dragons") + "2014" | `5e2014` |
+| "4th edition" or "dungeons & dragons, 4th" | `dnd4e` |
+| "3.5" or "v.3.5" | `dnd3.5e` |
+| no match | `unknown` |
+
+You can bypass auto-detection by passing `edition:<tag>` when uploading.
+
+### Step 3 — Chunking
+
+Each page's text is split into **~400-word chunks**. The split point is moved backwards to the nearest sentence-ending punctuation (`.`, `!`, `?`) so chunks never cut mid-sentence. Every chunk keeps its source page number for later citation.
+
+### Step 4 — Storage
+
+All chunks are bulk-inserted into an **SQLite FTS5** (full-text search) table in a single transaction. If the insertion fails, the book record is rolled back. The FTS5 index enables fast ranked keyword search over all stored text.
+
+---
+
 
 ### Option A — Drop PDFs in the data directory
 

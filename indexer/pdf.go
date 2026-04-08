@@ -1,3 +1,8 @@
+// This file implements the three PDF-processing sub-steps used by the indexer:
+//   - ExtractPages  — convert a PDF to per-page text (pdftotext or OCR)
+//   - DetectEdition — identify the ruleset edition from the extracted text
+//   - ChunkPages    — split page text into ~400-word chunks for FTS storage
+
 package indexer
 
 import (
@@ -138,7 +143,17 @@ func hasText(pages []PageText) bool {
 }
 
 // DetectEdition scans the first few pages of text for edition markers.
-// Returns a normalized edition tag or "unknown".
+// It checks for well-known phrases in priority order:
+//  1. Pathfinder 2e — "pathfinder second edition" or "pathfinder 2e"
+//  2. Pathfinder 1e — "pathfinder roleplaying game" (without "second edition")
+//  3. D&D 5e 2024 revised — "revised" + ("2024" or "one d&d")
+//  4. D&D 5e 2024 — "dungeons & dragons" + "2024" (without "revised")
+//  5. D&D 5e 2014 — ("5th edition" or "dungeons & dragons") + "2014"
+//  6. D&D 4th Edition — "4th edition" or "dungeons & dragons, 4th"
+//  7. D&D 3.5 Edition — "3.5" or "v.3.5"
+//
+// Returns a normalized edition tag (see edition tags in README) or "unknown"
+// if no recognised markers are found.
 func DetectEdition(pages []PageText) string {
 	sample := ""
 	for i, p := range pages {
@@ -163,8 +178,6 @@ func DetectEdition(pages []PageText) string {
 		return "dnd4e"
 	case contains(sample, "3.5") || contains(sample, "v.3.5"):
 		return "dnd3.5e"
-	case contains(sample, "dungeons & dragons") || contains(sample, "d&d"):
-		return "5e2014"
 	default:
 		return "unknown"
 	}
@@ -174,7 +187,10 @@ func contains(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
 
-// ChunkPages splits page text into ~400-word chunks, preserving page numbers.
+// ChunkPages splits page text into ~wordsPerChunk-word chunks, preserving page
+// numbers. Chunk boundaries are snapped back to the nearest sentence-ending
+// word (ending with `.`, `?`, or `!`) in the second half of each window to
+// avoid cutting mid-sentence. Use wordsPerChunk ≤ 0 to default to 400.
 func ChunkPages(pages []PageText, wordsPerChunk int) []chunkWithPage {
 	if wordsPerChunk <= 0 {
 		wordsPerChunk = 400
