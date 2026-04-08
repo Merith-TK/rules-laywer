@@ -24,7 +24,9 @@ type yamlConfig struct {
 	DiscordGuildID string `yaml:"discord_guild_id"`
 	AnthropicKey   string `yaml:"anthropic_api_key"`
 
-	Admin AdminConfig `yaml:"admin"`
+	Admin         AdminConfig `yaml:"admin"`
+	OCRWorkers    int         `yaml:"ocr_workers"`     // parallel OCR goroutines (default 4)
+	ScanOnStartup bool        `yaml:"scan_on_startup"` // scan PDF dir on launch (default false)
 }
 
 type Config struct {
@@ -34,6 +36,8 @@ type Config struct {
 	Admin          AdminConfig
 	DBPath         string
 	PDFDir         string
+	OCRWorkers     int
+	ScanOnStartup  bool
 }
 
 // LoadConfig loads configuration from the data directory.
@@ -58,6 +62,10 @@ func LoadConfig(dataDir string) Config {
 	yc := loadYAMLConfig(filepath.Join(dataDir, "config.yaml"))
 
 	// Env vars take priority over config.yaml values
+	ocr := yc.OCRWorkers
+	if ocr <= 0 {
+		ocr = 4
+	}
 	cfg := Config{
 		DiscordToken:   firstNonEmpty(os.Getenv("DISCORD_TOKEN"), yc.DiscordToken),
 		DiscordGuildID: firstNonEmpty(os.Getenv("DISCORD_GUILD_ID"), yc.DiscordGuildID),
@@ -65,6 +73,8 @@ func LoadConfig(dataDir string) Config {
 		Admin:          yc.Admin,
 		DBPath:         getEnvDefault("DB_PATH", filepath.Join(dataDir, "rules.db")),
 		PDFDir:         getEnvDefault("PDF_DIR", filepath.Join(dataDir, "pdfs")),
+		OCRWorkers:     ocr,
+		ScanOnStartup:  yc.ScanOnStartup,
 	}
 
 	if cfg.DiscordToken == "" {
@@ -131,6 +141,17 @@ admin:
   # User IDs. These specific users always have admin access regardless
   # of their roles. Right-click a user → Copy User ID.
   user_ids: []
+
+# OCR worker threads used when indexing scanned PDFs.
+# Higher values speed up indexing at the cost of more CPU/RAM.
+# Default: 4
+ocr_workers: 4
+
+# Scan the PDF directory for new books on startup.
+# When true, any PDF in the pdfs/ folder that is not yet indexed will be
+# indexed automatically before the bot connects to Discord.
+# Default: false
+scan_on_startup: false
 `
 	if err := os.WriteFile(path, []byte(defaultContent), 0644); err != nil {
 		log.Printf("warn: could not write default config.yaml: %v", err)

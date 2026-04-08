@@ -3,10 +3,15 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 
 	_ "modernc.org/sqlite"
 )
+
+// currentSchemaVersion is bumped whenever a breaking schema change is made.
+// The migrate() function runs all pending migrations in order.
+const currentSchemaVersion = 2
 
 type Book struct {
 	ID       int64
@@ -20,6 +25,7 @@ type Chunk struct {
 	BookName string
 	Edition  string
 	Page     int
+	Section  string // current section heading (may be empty)
 	Content  string
 }
 
@@ -46,24 +52,119 @@ func (s *Store) Close() error {
 }
 
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS books (
-			id        INTEGER PRIMARY KEY AUTOINCREMENT,
-			name      TEXT NOT NULL UNIQUE,
-			filename  TEXT NOT NULL,
-			edition   TEXT NOT NULL DEFAULT 'unknown',
-			added_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
+	// Schema version tracking table
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`INSERT INTO schema_version (version) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM schema_version)`); err != nil {
+		return err
+	}
 
-		CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-			book_name,
-			content,
-			book_id   UNINDEXED,
-			page      UNINDEXED,
-			edition   UNINDEXED
-		);
-	`)
-	return err
+	var version int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		return err
+	}
+
+	// v1: initial schema — books table + basic FTS5 chunks
+	if version < 1 {
+		if _, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS books (
+				id        INTEGER PRIMARY KEY AUTOINCREMENT,
+				name      TEXT NOT NULL UNIQUE,
+				filename  TEXT NOT NULL,
+				edition   TEXT NOT NULL DEFAULT 'unknown',
+				added_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+				book_name,
+				content,
+				book_id   UNINDEXED,
+				page      UNINDEXED,
+				edition   UNINDEXED
+			);
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = 1`); err != nil {
+			return err
+		}
+		version = 1
+	}
+
+	// v2: better FTS5 tokenizer (unicode61 + remove_diacritics).
+	// The old chunks are dropped — books with bad OCR text must be re-indexed.
+	if version < 2 {
+		log.Println("store: migrating to schema v2 — dropping old chunks (re-index all books)")
+		if _, err := db.Exec(`DROP TABLE IF EXISTS chunks`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = 2`); err != nil {
+			return err
+		}
+		version = 2
+	}
+
+	// v3: replace monolithic FTS5 table with a real chunks table + FTS5 content
+	// table backed by it. Adds section column. Books table is preserved.
+	if version < 3 {
+		log.Println("store: migrating to schema v3 — structured chunks + FTS5 content table (re-index all books)")
+		if _, err := db.Exec(`DROP TABLE IF EXISTS chunks`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`DROP TABLE IF EXISTS chunks_fts`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS chunks (
+				id        INTEGER PRIMARY KEY AUTOINCREMENT,
+				book_id   INTEGER NOT NULL,
+				book_name TEXT    NOT NULL,
+				edition   TEXT    NOT NULL,
+				page      INTEGER NOT NULL,
+				section   TEXT    NOT NULL DEFAULT '',
+				content   TEXT    NOT NULL
+			);
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+				content,
+				section,
+				book_name,
+				content     = 'chunks',
+				content_rowid = 'id',
+				tokenize    = 'unicode61 remove_diacritics 1'
+			);
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+				INSERT INTO chunks_fts(rowid, content, section, book_name)
+				VALUES (new.id, new.content, new.section, new.book_name);
+			END;
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`
+			CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+				INSERT INTO chunks_fts(chunks_fts, rowid, content, section, book_name)
+				VALUES ('delete', old.id, old.content, old.section, old.book_name);
+			END;
+		`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE schema_version SET version = 3`); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // BookExists returns true if a book with the given name is already indexed.
@@ -85,7 +186,8 @@ func (s *Store) AddBook(name, filename, edition string) (int64, error) {
 	return res.LastInsertId()
 }
 
-// AddChunks bulk-inserts chunks for a book.
+// AddChunks bulk-inserts chunks for a book into the chunks table.
+// The chunks_fts FTS5 table is kept in sync automatically via triggers.
 func (s *Store) AddChunks(bookID int64, bookName, edition string, chunks []Chunk) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -94,8 +196,8 @@ func (s *Store) AddChunks(bookID int64, bookName, edition string, chunks []Chunk
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO chunks (book_name, content, book_id, page, edition)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO chunks (book_id, book_name, edition, page, section, content)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -103,7 +205,7 @@ func (s *Store) AddChunks(bookID int64, bookName, edition string, chunks []Chunk
 	defer stmt.Close()
 
 	for _, c := range chunks {
-		if _, err := stmt.Exec(bookName, c.Content, bookID, c.Page, edition); err != nil {
+		if _, err := stmt.Exec(bookID, bookName, edition, c.Page, c.Section, c.Content); err != nil {
 			return fmt.Errorf("insert chunk p%d: %w", c.Page, err)
 		}
 	}
@@ -137,17 +239,19 @@ func (s *Store) runSearch(ftsQuery, edition string, limit int) ([]Chunk, error) 
 
 	if edition != "" {
 		rows, err = s.db.Query(`
-			SELECT book_name, edition, page, content
-			FROM chunks
-			WHERE chunks MATCH ? AND edition = ?
+			SELECT c.book_name, c.edition, c.page, c.section, c.content
+			FROM chunks c
+			JOIN chunks_fts f ON c.id = f.rowid
+			WHERE chunks_fts MATCH ? AND c.edition = ?
 			ORDER BY rank
 			LIMIT ?
 		`, ftsQuery, edition, limit)
 	} else {
 		rows, err = s.db.Query(`
-			SELECT book_name, edition, page, content
-			FROM chunks
-			WHERE chunks MATCH ?
+			SELECT c.book_name, c.edition, c.page, c.section, c.content
+			FROM chunks c
+			JOIN chunks_fts f ON c.id = f.rowid
+			WHERE chunks_fts MATCH ?
 			ORDER BY rank
 			LIMIT ?
 		`, ftsQuery, limit)
@@ -161,7 +265,7 @@ func (s *Store) runSearch(ftsQuery, edition string, limit int) ([]Chunk, error) 
 	var results []Chunk
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.BookName, &c.Edition, &c.Page, &c.Content); err != nil {
+		if err := rows.Scan(&c.BookName, &c.Edition, &c.Page, &c.Section, &c.Content); err != nil {
 			return nil, err
 		}
 		results = append(results, c)
@@ -206,6 +310,7 @@ func (s *Store) RemoveBook(name string) (bool, error) {
 		return false, err
 	}
 
+	// Delete chunks — the chunks_ad trigger removes them from chunks_fts automatically.
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE book_id = ?`, id); err != nil {
 		return false, err
 	}

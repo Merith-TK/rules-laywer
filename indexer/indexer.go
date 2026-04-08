@@ -11,12 +11,12 @@
 //
 //  2. Text Extraction — ExtractPages tries two strategies in order:
 //     a. pdftotext (poppler-utils) — fast, lossless for PDFs with embedded
-//        text. Pages are separated by form-feed characters (\f) in the
-//        pdftotext output, so each \f-delimited segment becomes one PageText.
+//     text. Pages are separated by form-feed characters (\f) in the
+//     pdftotext output, so each \f-delimited segment becomes one PageText.
 //     b. OCR fallback — if pdftotext yields no meaningful text (fewer than
-//        5 words per page), pdftoppm renders every page to a 200 DPI PNG
-//        image and tesseract performs OCR on each image individually.
-//        Pages that fail OCR are skipped rather than aborting the whole book.
+//     5 words per page), pdftoppm renders every page to a 200 DPI PNG
+//     image and tesseract performs OCR on each image individually.
+//     Pages that fail OCR are skipped rather than aborting the whole book.
 //
 //  3. Edition Detection — DetectEdition scans the combined text of the first
 //     three pages for known edition markers (e.g. "pathfinder second edition",
@@ -140,6 +140,7 @@ func IndexFromFile(path, bookName, forceEdition string, s *store.Store, progress
 			BookName: bookName,
 			Edition:  edition,
 			Page:     c.Page,
+			Section:  c.Section,
 			Content:  c.Content,
 		}
 	}

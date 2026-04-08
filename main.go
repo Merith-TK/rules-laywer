@@ -18,6 +18,10 @@ func main() {
 
 	cfg := LoadConfig(*dataDir)
 
+	// Configure OCR parallelism
+	indexer.OCRWorkers = cfg.OCRWorkers
+	log.Printf("OCR workers: %d", cfg.OCRWorkers)
+
 	// Open SQLite store
 	s, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -30,13 +34,15 @@ func main() {
 		log.Printf("warn: could not create PDF dir %s: %v", cfg.PDFDir, err)
 	}
 
-	// Scan PDF directory for any un-indexed books on startup
-	added, errs := indexer.ScanDir(cfg.PDFDir, s, func(msg string) { log.Println("startup:", msg) })
-	for _, name := range added {
-		log.Printf("startup: indexed %s", name)
-	}
-	for _, e := range errs {
-		log.Printf("startup warn: %v", e)
+	// Scan PDF directory for any un-indexed books on startup (optional)
+	if cfg.ScanOnStartup {
+		added, errs := indexer.ScanDir(cfg.PDFDir, s, func(msg string) { log.Println("startup:", msg) })
+		for _, name := range added {
+			log.Printf("startup: indexed %s", name)
+		}
+		for _, e := range errs {
+			log.Printf("startup warn: %v", e)
+		}
 	}
 
 	// Start the Discord bot

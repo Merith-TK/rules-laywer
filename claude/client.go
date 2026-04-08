@@ -69,10 +69,11 @@ func buildUserMessage(question string, chunks []store.Chunk) string {
 
 	sb.WriteString("## Rulebook Excerpts\n\n")
 	for i, c := range chunks {
-		sb.WriteString(fmt.Sprintf(
-			"**[%d] %s (%s), p.%d**\n%s\n\n",
-			i+1, c.BookName, c.Edition, c.Page, c.Content,
-		))
+		citation := fmt.Sprintf("%s (%s), p.%d", c.BookName, c.Edition, c.Page)
+		if c.Section != "" {
+			citation += " — " + c.Section
+		}
+		sb.WriteString(fmt.Sprintf("**[%d] %s**\n%s\n\n", i+1, citation, c.Content))
 	}
 
 	sb.WriteString("---\n\n")

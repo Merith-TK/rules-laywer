@@ -64,12 +64,11 @@ func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 			if att, ok := data.Resolved.Attachments[attID]; ok {
 				if strings.EqualFold(filepath.Ext(att.Filename), ".pdf") {
 					var dlErr error
-					pdfPath, dlErr = downloadAttachment(att.URL, att.Filename)
+					pdfPath, dlErr = b.saveAttachment(att.URL, att.Filename)
 					if dlErr != nil {
 						response = fmt.Sprintf("Failed to download attachment: %v", dlErr)
 						break
 					}
-					defer os.Remove(pdfPath)
 					if name == "" {
 						name = strings.TrimSuffix(att.Filename, filepath.Ext(att.Filename))
 					}
@@ -151,12 +150,11 @@ func (b *Bot) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 			att := m.Attachments[0]
 			if strings.EqualFold(filepath.Ext(att.Filename), ".pdf") {
 				var dlErr error
-				pdfPath, dlErr = downloadAttachment(att.URL, att.Filename)
+				pdfPath, dlErr = b.saveAttachment(att.URL, att.Filename)
 				if dlErr != nil {
 					response = fmt.Sprintf("Failed to download attachment: %v", dlErr)
 					break
 				}
-				defer os.Remove(pdfPath)
 				if name == "" {
 					name = strings.TrimSuffix(att.Filename, filepath.Ext(att.Filename))
 				}
@@ -380,23 +378,26 @@ func parseUploadArgs(args string) (edition, name, url string) {
 	return
 }
 
-// downloadAttachment downloads a Discord attachment to a temp file and returns its path.
-func downloadAttachment(url, filename string) (string, error) {
+// saveAttachment downloads a Discord attachment URL and saves it to pdfDir,
+// returning the path. If a file with the same name already exists it is
+// overwritten so re-uploading a corrected PDF works as expected.
+func (b *Bot) saveAttachment(url, filename string) (string, error) {
 	resp, err := discordHTTPClient.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	tmp, err := os.CreateTemp("", "ruleslawyer-*-"+filename)
+	dest := filepath.Join(b.pdfDir, filename)
+	f, err := os.Create(dest)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create %s: %w", dest, err)
 	}
-	defer tmp.Close()
+	defer f.Close()
 
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		os.Remove(tmp.Name())
-		return "", err
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		os.Remove(dest)
+		return "", fmt.Errorf("write %s: %w", dest, err)
 	}
-	return tmp.Name(), nil
+	return dest, nil
 }
