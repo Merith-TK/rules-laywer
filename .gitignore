@@ -5,5 +5,7 @@ rules-laywer-data/
 rules-lawyer
 rules-laywer
 
-# Environment files at root (legacy location)
-.env
+
+# dev files
+vendor/
+tmp/
